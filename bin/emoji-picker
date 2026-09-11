@@ -40,6 +40,7 @@ import urllib.parse
 import uuid
 
 HELPER = pathlib.Path(__file__).resolve()
+sys.dont_write_bytecode = True  # no __pycache__ in the plugin (the shell watches it)
 sys.path.insert(0, str(HELPER.parent))
 import plugin_safety as safe  # noqa: E402
 
