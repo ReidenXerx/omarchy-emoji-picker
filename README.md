@@ -1,5 +1,7 @@
 # Emoji picker
 
+![Emoji picker](preview.png)
+
 An [Omarchy](https://omarchy.org) overlay for **emoji, symbols, kaomoji and GIFs**. Whatever
 you pick is typed straight into the app you were using.
 
