@@ -16,6 +16,8 @@ Item {
   property var manifest: null
   property bool opened: false
 
+  // Helpers always run under the system interpreter, never through PATH or a shebang.
+  readonly property string python: "/usr/bin/python3"
   readonly property string helper: localPath("bin/emoji-picker")
   readonly property string statePath: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state"))
     + "/omarchy/emoji-picker.json"
@@ -154,10 +156,78 @@ Item {
     if (root.opened) rebuild(true)
   }
 
+  // Helpers that take a payload (text to type, the state document) get it over stdin,
+  // never argv. One Process per call, so a paste still finishes when another starts;
+  // each one destroys itself once its child has exited.
+  Component {
+    id: helperCall
+
+    Process {
+      id: call
+      property string input: ""
+      property var done: null
+
+      stdinEnabled: true
+      onStarted: {
+        write(call.input)
+        call.input = ""
+        stdinEnabled = false
+      }
+      onExited: {
+        var callback = call.done
+        call.done = null
+        if (typeof callback === "function") callback()
+        call.destroy()
+      }
+    }
+  }
+
+  function runHelper(args, input, done) {
+    var proc = helperCall.createObject(root, {
+      command: [root.python, root.helper].concat(args),
+      input: String(input || ""),
+      done: done || null
+    })
+    if (!proc) {
+      if (typeof done === "function") done()
+      return
+    }
+    proc.running = true
+  }
+
+  // One state write at a time, newest snapshot last, so an older document can never
+  // land after a newer one. The watchdog frees the queue if a writer never reports back.
+  property bool stateWriting: false
+  property bool stateQueued: false
+  property int stateGeneration: 0
+
   function saveState() {
-    Quickshell.execDetached([root.helper, "state-write", JSON.stringify({
+    root.stateQueued = true
+    if (!root.stateWriting) flushState()
+  }
+
+  function flushState() {
+    var generation = ++root.stateGeneration
+    root.stateQueued = false
+    root.stateWriting = true
+    stateWatchdog.restart()
+    runHelper(["state-write"], JSON.stringify({
       version: 1, tab: root.lastTab, tone: root.tone, recents: root.recents
-    })])
+    }), function() {
+      if (generation !== root.stateGeneration) return
+      stateWatchdog.stop()
+      root.stateWriting = false
+      if (root.stateQueued) Qt.callLater(root.flushState)
+    })
+  }
+
+  Timer {
+    id: stateWatchdog
+    interval: 10000
+    onTriggered: {
+      root.stateWriting = false
+      if (root.stateQueued) root.flushState()
+    }
   }
 
   // A cell that appears under a still pointer (after typing, a tab switch, a scroll)
@@ -275,6 +345,28 @@ Item {
     stdout: StdioCollector { onStreamFinished: root.gifReply(text) }
   }
 
+  // The helper gives up on KLIPY after 30 s by itself; this is the backstop in case it
+  // hangs anyway. It polls only while a request is loading.
+  readonly property int gifWatchdogMs: 45000
+  property real gifStartedAt: 0
+  property bool gifTimedOut: false
+
+  Timer {
+    id: gifWatchdog
+    interval: 5000
+    repeat: true
+    running: root.gifLoading
+    onTriggered: {
+      if (Date.now() - root.gifStartedAt < root.gifWatchdogMs) return
+      root.gifLoading = false
+      if (!gifProcess.running) return
+      root.gifTimedOut = true
+      gifProcess.signal(15)
+      root.gifError = "offline"
+      if (root.tab === "gif") root.rebuild(true)
+    }
+  }
+
   function maybeFetchGifs() {
     var q = root.query.trim()
     if (root.gifQuery !== q || root.gifError !== "" || root.gifItems.length === 0) fetchGifs(1)
@@ -283,13 +375,17 @@ Item {
   function fetchGifs(page) {
     var q = root.query.trim()
     root.gifLoading = true
+    root.gifTimedOut = false
+    root.gifStartedAt = Date.now()
     gifProcess.exec(q !== ""
-      ? [root.helper, "gif", "search", q, String(page)]
-      : [root.helper, "gif", "trending", String(page)])
+      ? [root.python, root.helper, "gif", "search", q, String(page)]
+      : [root.python, root.helper, "gif", "trending", String(page)])
   }
 
   function gifReply(raw) {
     var r = Model.parseGifReply(raw)
+    // The watchdog stopped this request and has already said so.
+    if (r.q === null && root.gifTimedOut) { root.gifTimedOut = false; return }
     // A reply to a search the user has already typed past.
     if (r.q !== null && r.q !== root.query.trim()) return
     root.gifLoading = false
@@ -313,7 +409,7 @@ Item {
 
   function setupKey() {
     root.dismiss()
-    Quickshell.execDetached([root.helper, "gif", "key", "set"])
+    Quickshell.execDetached([root.python, root.helper, "gif", "key", "set"])
   }
 
   // ---------------------------------------------------------------- actions
@@ -328,18 +424,17 @@ Item {
     root.lastTab = root.tab
     saveState()
 
-    var command
-    if (item.kind === "gif") {
-      command = mode === "copy"
-        ? [root.helper, "copy", item.url]
-        : [root.helper, "gif", mode === "link" ? "link" : "insert", item.id, item.url]
-    } else {
-      command = [root.helper, mode === "copy" ? "copy" : "insert", Model.textFor(item, root.tone)]
-    }
     // Close first: the overlay holds keyboard focus, and the paste has to reach the app
     // underneath it.
     root.dismiss()
-    Quickshell.execDetached(command)
+    if (item.kind === "gif" && mode !== "copy") {
+      // Only an id and a klipy.com link, both validated by the helper. Detached, so a
+      // slow download survives the shell reloading.
+      Quickshell.execDetached([root.python, root.helper, "gif", mode === "link" ? "link" : "insert", item.id, item.url])
+    } else {
+      // The text itself goes over stdin.
+      runHelper([mode === "copy" ? "copy" : "insert"], item.kind === "gif" ? item.url : Model.textFor(item, root.tone))
+    }
   }
 
   function setTone(t) {

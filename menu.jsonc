@@ -16,15 +16,15 @@
   "setup.emoji-picker.key": {
     "icon": "󰌉",
     "label": "Set the GIF search key",
-    "action": "@PLUGIN_BIN@/emoji-picker gif key set"
+    "action": "/usr/bin/python3 @PLUGIN_BIN@/emoji-picker gif key set"
   },
   "setup.emoji-picker.key-remove": {
     "icon": "󰌊",
     "label": "Remove the GIF search key",
-    "action": "@PLUGIN_BIN@/emoji-picker gif key clear"
+    "action": "/usr/bin/python3 @PLUGIN_BIN@/emoji-picker gif key clear"
   },
   "setup.emoji-picker.forget": {
     "icon": "󰋚",
     "label": "Forget recent picks",
-    "action": "@PLUGIN_BIN@/emoji-picker forget-recents"
+    "action": "/usr/bin/python3 @PLUGIN_BIN@/emoji-picker forget-recents"
   },

@@ -101,12 +101,30 @@ KLIPY asks for a stable per-user id. The picker generates a random one per insta
 | `~/.local/state/omarchy/emoji-picker-id` | the random KLIPY user id |
 | keyring, `service=omarchy-emoji-picker` | the KLIPY API key |
 
+## Security
+
+- The helper runs as `/usr/bin/python3`, never through `env`. Every program it starts
+  (`wl-copy`, `wtype`, `secret-tool`, `zenity`, `notify-send`, `omarchy-shell`) must be a
+  root-owned, non-writable file in `/usr/bin`, and runs with `PATH=/usr/bin`, a deadline
+  and an output cap. No shell is involved anywhere.
+- The text being typed, the state document and the API key travel over stdin, never on
+  a command line.
+- The state file, the KLIPY id and GIF files are reached without following symlinks,
+  refused unless they are regular files you own, read with size caps, and replaced
+  atomically through random `O_EXCL` temporary files. The shared code is
+  `bin/plugin_safety.py`.
+- KLIPY replies are capped at 2 MB (a GIF at 12 MB) before decoding, JSON is bounded in
+  depth and size, every call has an overall deadline, ads are dropped, and only HTTPS
+  `klipy.com` media links are accepted.
+- Pasted GIFs are `0600` files in a `0700` directory under `$XDG_RUNTIME_DIR`, removed
+  after ten minutes by a detached, deadline-bound copy of the helper.
+
 ## From the command line
 
 ```bash
 emoji-picker open                  # show the picker
 emoji-picker insert "¯\_(ツ)_/¯"   # type text into the focused app
-emoji-picker copy "→"              # just copy it
+printf '→' | emoji-picker copy     # just copy it (text is read from stdin when omitted)
 emoji-picker forget-recents
 emoji-picker gif key set | clear | status
 emoji-picker gif search "cat" | jq '.items[0]'
@@ -137,7 +155,8 @@ unparseable, because a malformed menu file silently disables **every** user entr
 and licenses are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ```bash
-node tests/model-test.js    # search, ranking, recents, GIF parsing
+node tests/model-test.js          # search, ranking, recents, GIF parsing
+python3 tests/helper_test.py      # helper: files, KLIPY replies, keyring, paste
 ```
 
 ## Remove

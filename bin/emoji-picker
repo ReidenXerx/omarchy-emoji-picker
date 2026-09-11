@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Helper for the Emoji picker plugin.
 
   emoji-picker open                   show the picker
-  emoji-picker insert <text>          type text into the focused app
-  emoji-picker copy <text>            put text on the clipboard only
-  emoji-picker state-write <json>     save recents and skin tone (atomic)
+  emoji-picker insert [text]          type text into the focused app (stdin when omitted)
+  emoji-picker copy [text]            put text on the clipboard only (stdin when omitted)
+  emoji-picker state-write            save recents and skin tone; JSON document on stdin
   emoji-picker forget-recents         clear the recent picks
 
   emoji-picker gif search <query> [page]
@@ -19,33 +19,85 @@ Typing works the way Omarchy's own emoji picker does: the text goes on the clipb
 marked sensitive (so clipboard history skips it), Shift+Insert pastes it, and the
 clipboard is released straight after. That delivers any Unicode regardless of the
 active keyboard layout, where simulated key presses cannot.
+
+Safety: external programs resolve only to root-owned tools in /usr/bin and run with
+PATH=/usr/bin, a deadline and an output cap (plugin_safety). Files are reached without
+following symlinks, read with size caps and replaced atomically through random
+temporary files. Payloads and the API key travel over stdin, never argv. Network
+replies are size-capped before JSON decoding.
 """
+import http.client
 import json
 import os
 import pathlib
 import re
-import shutil
+import signal
+import stat
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 
+HELPER = pathlib.Path(__file__).resolve()
+sys.path.insert(0, str(HELPER.parent))
+import plugin_safety as safe  # noqa: E402
+
 PLUGIN_ID = "reidenxerx.emoji-picker"
-STATE_DIR = pathlib.Path(os.environ.get("XDG_STATE_HOME") or pathlib.Path.home() / ".local/state") / "omarchy"
+PYTHON = "/usr/bin/python3"
+
+
+def _state_home():
+    env = os.environ.get("XDG_STATE_HOME")
+    if env and os.path.isabs(env):
+        return pathlib.Path(env)
+    return pathlib.Path(safe.home_dir()) / ".local/state"
+
+
+STATE_DIR = _state_home() / "omarchy"
 STATE_FILE = STATE_DIR / "emoji-picker.json"
 CUSTOMER_ID_FILE = STATE_DIR / "emoji-picker-id"
-RUNTIME_DIR = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "omarchy-emoji-picker"
+RUNTIME_DIR = pathlib.Path(safe.runtime_dir()) / "omarchy-emoji-picker"
 
 KLIPY_BASE = "https://api.klipy.com/api/v1/"
 KEYRING_ATTRS = ["service", "omarchy-emoji-picker", "provider", "klipy"]
 USER_AGENT = f"{PLUGIN_ID}/1.0 (+https://github.com/ReidenXerx/omarchy-emoji-picker)"
 
 PER_PAGE = 24
+MAX_PAGE = 1000
+MAX_ITEMS = 100
+
+# Size caps: every read, every child's output and every network reply is bounded.
+STATE_MAX = 512 * 1024
+STATE_LIMITS = {"max_depth": 8, "max_items": 20000, "max_string": 16384}
+TEXT_MAX = 64 * 1024
+ID_MAX = 256
+KEY_OUTPUT_MAX = 4096
+API_MAX = 2 * 1024 * 1024
+API_LIMITS = {"max_depth": 16, "max_items": 100000, "max_string": 1 << 18}
 MAX_GIF_BYTES = 12 * 1024 * 1024
+
+# Deadlines (seconds). The socket timeout bounds each read; these bound the whole call,
+# so a server that trickles bytes cannot keep a helper alive.
+LOOKUP_TIMEOUT = 5
+KEYRING_WRITE_TIMEOUT = 120
+DIALOG_TIMEOUT = 300
+SEARCH_DEADLINE = 30
+DOWNLOAD_DEADLINE = 45
+SHARE_DEADLINE = 15
+
 GIF_FILE_TTL_SEC = 600
+FORGET_SLACK_SEC = 5
+
+KEY_RE = re.compile(r"[A-Za-z0-9_\-]{8,200}")
+CUSTOMER_ID_RE = re.compile(r"[0-9a-f\-]{36}")
+# KLIPY slugs are URL path segments (POST gifs/share/{slug}), so RFC 3986 unreserved.
+SLUG_RE = re.compile(r"[A-Za-z0-9._~\-]{1,200}")
+GIF_NAME_RE = re.compile(r"[A-Za-z0-9_\-]{1,80}\.gif")
+
+
+class Deadline(Exception):
+    """A whole-call deadline passed."""
 
 
 def fail(msg, code=1):
@@ -53,74 +105,190 @@ def fail(msg, code=1):
     return code
 
 
+def warn(msg):
+    print(f"emoji-picker: {msg}", file=sys.stderr)
+
+
 def notify(summary, body=""):
-    if shutil.which("notify-send"):
-        subprocess.run(["notify-send", "-a", "Emoji picker", summary, body], check=False)
+    if not safe.has_tool("notify-send"):
+        return
+    try:
+        safe.spawn(["notify-send", "-a", "Emoji picker", summary, body], timeout=10)
+    except (safe.UnsafeError, OSError):
+        pass
+
+
+def with_deadline(seconds, fn, *args, default=None):
+    """fn(*args), or default once `seconds` have passed (SIGALRM, main thread)."""
+    def on_alarm(_signum, _frame):
+        raise Deadline()
+
+    previous = signal.signal(signal.SIGALRM, on_alarm)
+    signal.alarm(int(seconds))
+    try:
+        return fn(*args)
+    except Deadline:
+        return default
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def payload_arg(args, what):
+    """The text to type or copy: the argument when given (command line use), otherwise
+    stdin, capped. The picker always sends it over stdin."""
+    if args:
+        text = args[0]
+    else:
+        text = safe.read_stdin(TEXT_MAX).decode("utf-8")
+        if text.endswith("\n"):
+            text = text[:-1]
+    if not text:
+        raise ValueError(f"{what} needs the text")
+    if len(text.encode("utf-8")) > TEXT_MAX:
+        raise safe.TooLarge(f"{what}: text too long")
+    return text
 
 
 # ------------------------------------------------------------------ typing
 
+def session_env():
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("LD_", "PYTHON"))}
+    env["PATH"] = safe.SAFE_PATH
+    return env
+
+
+def copier_argv(mime):
+    return [safe.tool("wl-copy"), "--type", mime, "--sensitive", "--foreground"]
+
+
+def stop_group(proc, grace=0.5):
+    """Terminate the copier's whole process group, then make sure it is gone."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            break
+        try:
+            proc.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def paste(payload, mime, hold_sec=0.2):
     """Offer payload on the clipboard, press Shift+Insert, then withdraw the offer."""
-    if not shutil.which("wl-copy"):
-        return fail("wl-copy is missing (package wl-clipboard)")
+    try:
+        argv = copier_argv(mime)
+        safe.tool("wtype")
+    except safe.UnsafeError as e:
+        return fail(f"{e} (packages wl-clipboard and wtype)")
     copier = subprocess.Popen(
-        ["wl-copy", "--type", mime, "--sensitive", "--foreground"],
-        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    copier.stdin.write(payload.encode("utf-8"))
-    copier.stdin.close()
-    time.sleep(0.15)
-    if shutil.which("wtype"):
-        subprocess.run(["wtype", "-M", "shift", "-k", "Insert", "-m", "shift"],
-                       stderr=subprocess.DEVNULL, check=False)
-    time.sleep(hold_sec)
-    copier.terminate()
-    return 0
+        argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=session_env(), start_new_session=True, close_fds=True)
+    try:
+        try:
+            copier.stdin.write(payload.encode("utf-8"))
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            try:
+                copier.stdin.close()
+            except OSError:
+                pass
+        time.sleep(0.15)
+        if copier.poll() is not None:
+            return fail("wl-copy exited before the paste")
+        typed = safe.run(["wtype", "-M", "shift", "-k", "Insert", "-m", "shift"],
+                         timeout=5, max_output=4096)
+        time.sleep(hold_sec)
+        if typed.returncode != 0 or typed.timed_out:
+            return fail("wtype could not press Shift+Insert")
+        return 0
+    finally:
+        stop_group(copier)
 
 
 def cmd_insert(args):
-    if not args:
-        return fail("insert needs the text to type", 2)
-    return paste(args[0], "text/plain;charset=utf-8")
+    try:
+        text = payload_arg(args, "insert")
+    except (ValueError, UnicodeDecodeError, safe.TooLarge) as e:
+        return fail(str(e), 2)
+    return paste(text, "text/plain;charset=utf-8")
 
 
 def cmd_copy(args):
-    if not args:
-        return fail("copy needs the text", 2)
-    subprocess.run(["wl-copy", "--type", "text/plain;charset=utf-8"], input=args[0].encode("utf-8"), check=False)
-    return 0
+    try:
+        text = payload_arg(args, "copy")
+    except (ValueError, UnicodeDecodeError, safe.TooLarge) as e:
+        return fail(str(e), 2)
+    # No --foreground: wl-copy forks its own server and exits, which keeps the copy
+    # after this helper is gone. spawn() still bounds that first process.
+    try:
+        proc = safe.spawn(["wl-copy", "--type", "text/plain;charset=utf-8"], input=text, timeout=10)
+    except (safe.UnsafeError, OSError) as e:
+        return fail(f"{e} (package wl-clipboard)")
+    try:
+        rc = proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        return fail("wl-copy did not finish")
+    return 0 if rc == 0 else fail("wl-copy failed")
 
 
 def cmd_open(_args):
-    return subprocess.run(["omarchy-shell", "shell", "toggle", PLUGIN_ID, "{}"], check=False).returncode
+    try:
+        r = safe.run(["omarchy-shell", "shell", "toggle", PLUGIN_ID, "{}"], timeout=10, max_output=65536)
+    except (safe.UnsafeError, OSError) as e:
+        return fail(str(e))
+    sys.stdout.write(r.text())
+    sys.stderr.write(r.stderr.decode("utf-8", "replace"))
+    return r.returncode if not r.timed_out else fail("omarchy-shell did not answer")
+
+
+# ------------------------------------------------------------------ state
+
+def write_state(data):
+    safe.write_json(STATE_FILE, data, indent=1)
 
 
 def cmd_forget_recents(_args):
     try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        data = safe.read_json(STATE_FILE, STATE_MAX, default={}, **STATE_LIMITS)
+    except RecursionError:
         data = {}
+    except safe.UnsafeError as e:
+        return fail(f"forget-recents: {e}")
     if not isinstance(data, dict):
         data = {}
     data["recents"] = {}
-    rc = cmd_state_write([json.dumps(data)])
-    if rc == 0:
-        notify("Recent picks forgotten")
-        print("Forgot recent picks.")
-    return rc
+    try:
+        write_state(data)
+    except (safe.UnsafeError, OSError) as e:
+        return fail(f"forget-recents: {e}")
+    notify("Recent picks forgotten")
+    print("Forgot recent picks.")
+    return 0
 
 
 def cmd_state_write(args):
-    if not args:
-        return fail("state-write needs JSON", 2)
+    if args:
+        return fail("state-write reads the JSON document from stdin, not the command line", 2)
     try:
-        data = json.loads(args[0])
-    except ValueError:
+        data = safe.loads(safe.read_stdin(STATE_MAX), **STATE_LIMITS)
+    except safe.TooLarge as e:
+        return fail(f"state-write: {e}", 2)
+    except (ValueError, UnicodeDecodeError, RecursionError):
         return fail("state-write: not valid JSON", 2)
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
-    tmp.replace(STATE_FILE)
+    if not isinstance(data, dict):
+        return fail("state-write: expected a JSON object", 2)
+    try:
+        write_state(data)
+    except (safe.UnsafeError, OSError) as e:
+        return fail(f"state-write: {e}")
     return 0
 
 
@@ -129,22 +297,29 @@ def cmd_state_write(args):
 def read_key():
     """The key stays inside this process: read from the keyring over stdout, used in a
     request, never passed on a command line or printed."""
-    if not shutil.which("secret-tool"):
+    if not safe.has_tool("secret-tool"):
         return None
-    r = subprocess.run(["secret-tool", "lookup", *KEYRING_ATTRS], capture_output=True, text=True, check=False)
-    key = r.stdout.strip()
-    return key or None
+    try:
+        r = safe.run(["secret-tool", "lookup", *KEYRING_ATTRS], timeout=LOOKUP_TIMEOUT, max_output=KEY_OUTPUT_MAX)
+    except (safe.UnsafeError, OSError):
+        return None
+    if not r.ok:
+        return None
+    key = r.text().strip()
+    return key if KEY_RE.fullmatch(key) else None
 
 
 def cmd_key(args):
     sub = args[0] if args else "status"
-    if not shutil.which("secret-tool"):
+    if not safe.has_tool("secret-tool"):
         return fail("secret-tool is missing (package libsecret)")
     if sub == "status":
         print("KLIPY API key: stored in the keyring" if read_key() else "KLIPY API key: not set")
         return 0
     if sub == "clear":
-        subprocess.run(["secret-tool", "clear", *KEYRING_ATTRS], check=False)
+        r = safe.run(["secret-tool", "clear", *KEYRING_ATTRS], timeout=KEYRING_WRITE_TIMEOUT, max_output=KEY_OUTPUT_MAX)
+        if r.returncode != 0 or r.timed_out:
+            return fail("could not clear the key from the keyring")
         notify("GIF search key removed")
         print("Removed the KLIPY API key from the keyring.")
         return 0
@@ -153,35 +328,41 @@ def cmd_key(args):
     return fail(f"unknown key command: {sub}", 2)
 
 
-def key_set():
+def ask_key():
     if sys.stdin.isatty():
         import getpass
-        key = getpass.getpass("KLIPY API key (input hidden): ").strip()
-    elif shutil.which("zenity"):
-        r = subprocess.run(
+        return getpass.getpass("KLIPY API key (input hidden): ").strip()
+    if safe.has_tool("zenity"):
+        r = safe.run(
             ["zenity", "--entry", "--hide-text", "--title=Emoji picker",
              "--text=Paste your KLIPY API key.\nGet a free one at partner.klipy.com → API Keys.\n"
              "It is stored in your keyring and only ever sent to KLIPY."],
-            capture_output=True, text=True, check=False)
-        if r.returncode != 0:
-            return 1
-        key = r.stdout.strip()
-    else:
-        key = sys.stdin.readline().strip()
+            timeout=DIALOG_TIMEOUT, max_output=KEY_OUTPUT_MAX)
+        if not r.ok:
+            return None
+        return r.text().strip()
+    return sys.stdin.buffer.readline(KEY_OUTPUT_MAX).decode("utf-8", "replace").strip()
+
+
+def key_set():
+    key = ask_key()
+    if key is None:
+        return 1
     if not key:
         return fail("no key entered")
-    if not re.fullmatch(r"[A-Za-z0-9_\-]{8,200}", key):
+    if not KEY_RE.fullmatch(key):
         notify("That does not look like a KLIPY API key", "Nothing was saved.")
         return fail("that does not look like an API key; nothing saved")
 
-    reply = klipy_request(key, "gifs/trending", {"page": 1, "per_page": 1})
-    if reply.get("error") in ("bad-key",):
+    reply = with_deadline(SEARCH_DEADLINE, klipy_request, key, "gifs/trending", {"page": 1, "per_page": 1},
+                          default={"error": "offline"})
+    if reply.get("error") == "bad-key":
         notify("KLIPY did not accept that key", "Nothing was saved.")
         return fail("KLIPY rejected the key; nothing saved")
 
-    r = subprocess.run(["secret-tool", "store", "--label=Emoji picker: KLIPY API key", *KEYRING_ATTRS],
-                       input=key, text=True, check=False)
-    if r.returncode != 0:
+    r = safe.run(["secret-tool", "store", "--label=Emoji picker: KLIPY API key", *KEYRING_ATTRS],
+                 input=key, timeout=KEYRING_WRITE_TIMEOUT, max_output=KEY_OUTPUT_MAX)
+    if r.returncode != 0 or r.timed_out:
         return fail("could not write to the keyring")
     checked = "" if not reply.get("error") else f" (could not verify it: {reply['error']})"
     notify("GIF search is ready", "KLIPY API key saved to your keyring." + checked)
@@ -192,80 +373,135 @@ def key_set():
 # ------------------------------------------------------------------ KLIPY
 
 def customer_id():
-    """KLIPY asks for a stable per-user id. A random one per install, nothing personal."""
+    """KLIPY asks for a stable per-user id. A random one per install, nothing personal.
+    If the file is unsafe (a symlink, not ours, oversized) it is left alone and this
+    request goes out with a throwaway id."""
     try:
-        value = CUSTOMER_ID_FILE.read_text().strip()
-        if re.fullmatch(r"[0-9a-f\-]{36}", value):
+        blob = safe.read_file(CUSTOMER_ID_FILE, ID_MAX)
+    except safe.UnsafeError as e:
+        warn(str(e))
+        return str(uuid.uuid4())
+    if blob is not None:
+        value = blob.decode("utf-8", "replace").strip()
+        if CUSTOMER_ID_RE.fullmatch(value):
             return value
-    except OSError:
-        pass
     value = str(uuid.uuid4())
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    CUSTOMER_ID_FILE.write_text(value + "\n")
+    try:
+        safe.write_file(CUSTOMER_ID_FILE, value + "\n", mode=0o600)
+    except (safe.UnsafeError, OSError) as e:
+        warn(str(e))
     return value
 
 
 def klipy_request(key, path, params=None, method="GET", body=None):
+    if not KEY_RE.fullmatch(key or ""):
+        return {"error": "bad-key"}
     url = KLIPY_BASE + urllib.parse.quote(key, safe="") + "/" + path
     if params:
         url += "?" + urllib.parse.urlencode(params)
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers={
-        "User-Agent": USER_AGENT, "Accept": "application/json",
-        **({"Content-Type": "application/json"} if data else {})})
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    if data:
+        headers["Content-Type"] = "application/json"
     try:
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            return json.loads(resp.read().decode("utf-8") or "{}")
-    except urllib.error.HTTPError as e:
-        text = e.read().decode("utf-8", "replace")
-        if e.code == 429:
-            return {"error": "rate-limited"}
-        if e.code in (401, 403) or "invalid" in text.lower():
-            return {"error": "bad-key"}
-        return {"error": f"http-{e.code}"}
-    except (urllib.error.URLError, TimeoutError, OSError):
-        return {"error": "offline"}
-    except ValueError:
+        status, blob = safe.http_request(url, method=method, body=data, headers=headers,
+                                         timeout=12, max_bytes=API_MAX)
+    except safe.TooLarge:
         return {"error": "bad-reply"}
+    except (safe.UnsafeError, OSError, http.client.HTTPException):
+        return {"error": "offline"}
+    if status == 429:
+        return {"error": "rate-limited"}
+    if status in (401, 403) or (status >= 400 and b"invalid" in blob.lower()):
+        return {"error": "bad-key"}
+    if not 200 <= status < 300:
+        return {"error": f"http-{status}"}
+    try:
+        reply = safe.loads(blob or b"{}", **API_LIMITS)
+    except (ValueError, UnicodeDecodeError, RecursionError, safe.TooLarge):
+        return {"error": "bad-reply"}
+    return reply if isinstance(reply, dict) else {"error": "bad-reply"}
+
+
+def _dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _dimension(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 1 <= value <= 10000:
+        return 1
+    return int(value)
 
 
 def pick(file, sizes, kinds, max_bytes=None):
     for size in sizes:
-        variant = (file or {}).get(size) or {}
+        variant = _dict(_dict(file).get(size))
         for kind in kinds:
-            meta = variant.get(kind) or {}
-            if not meta.get("url"):
+            meta = _dict(variant.get(kind))
+            url = meta.get("url")
+            if not isinstance(url, str) or not trusted_media_url(url):
                 continue
-            if max_bytes and meta.get("size") and meta["size"] > max_bytes:
+            size_bytes = meta.get("size")
+            if (max_bytes and isinstance(size_bytes, (int, float)) and not isinstance(size_bytes, bool)
+                    and size_bytes > max_bytes):
                 continue
             return meta
     return None
 
 
 def normalize_results(reply):
+    reply = _dict(reply)
     if reply.get("error"):
-        return reply
+        return {"error": str(reply["error"])[:40]}
     if reply.get("result") is False:
         return {"error": "bad-reply"}
-    data = reply.get("data") or {}
+    data = _dict(reply.get("data"))
+    listing = data.get("data")
     items = []
-    for it in data.get("data") or []:
-        if not isinstance(it, dict) or it.get("type") == "ad" or not it.get("slug"):
+    for it in listing if isinstance(listing, list) else []:
+        if len(items) >= MAX_ITEMS:
+            break
+        if not isinstance(it, dict) or it.get("type") == "ad":
             continue
-        file = it.get("file") or {}
+        slug = it.get("slug")
+        if not isinstance(slug, str) or not SLUG_RE.fullmatch(slug):
+            continue
+        file = it.get("file")
         preview = pick(file, ("sm", "xs", "md"), ("webp", "gif"))
         full = pick(file, ("hd", "md", "sm"), ("gif",), MAX_GIF_BYTES)
         if not preview or not full:
             continue
+        title = it.get("title")
         items.append({
-            "id": it["slug"],
-            "title": it.get("title") or "",
+            "id": slug,
+            "title": title[:200] if isinstance(title, str) else "",
             "preview": preview["url"],
             "url": full["url"],
-            "w": preview.get("width") or 1,
-            "h": preview.get("height") or 1,
+            "w": _dimension(preview.get("width")),
+            "h": _dimension(preview.get("height")),
         })
-    return {"items": items, "hasNext": bool(data.get("has_next"))}
+    return {"items": items, "hasNext": data.get("has_next") is True}
+
+
+def page_arg(value):
+    if isinstance(value, str) and value.isdigit() and len(value) <= 4:
+        return max(1, min(MAX_PAGE, int(value)))
+    return 1
+
+
+def gif_listing(sub, query, page):
+    """The JSON the picker reads for a search or trending page. Always echoes what was
+    asked, so the picker can drop a reply to a search the user has already typed past."""
+    echo = {"q": query, "page": page}
+    key = read_key()
+    if not key:
+        return {"error": "no-key", **echo}
+    params = {"page": page, "per_page": PER_PAGE, "customer_id": customer_id()}
+    if query:
+        params["q"] = query
+    reply = with_deadline(SEARCH_DEADLINE, klipy_request, key, "gifs/" + sub, params,
+                          default={"error": "offline"})
+    return {**normalize_results(reply), **echo}
 
 
 def cmd_gif(args):
@@ -274,46 +510,56 @@ def cmd_gif(args):
     if sub == "key":
         return cmd_key(rest)
     if sub in ("search", "trending"):
+        safe.die_with_parent()
         page, query = 1, ""
         if sub == "search":
             if not rest:
                 return fail("gif search needs a query", 2)
             query = rest[0].strip()[:100]
-            if len(rest) > 1 and rest[1].isdigit():
-                page = int(rest[1])
-        elif rest and rest[0].isdigit():
-            page = int(rest[0])
-        # Echo what was asked, so the picker can drop a reply to a search the user has
-        # already typed past.
-        echo = {"q": query, "page": page}
-        key = read_key()
-        if not key:
-            print(json.dumps({"error": "no-key", **echo}))
-            return 0
-        params = {"page": page, "per_page": PER_PAGE, "customer_id": customer_id()}
-        if query:
-            params["q"] = query
-        print(json.dumps({**normalize_results(klipy_request(key, "gifs/" + sub, params)), **echo}))
+            if len(rest) > 1:
+                page = page_arg(rest[1])
+        elif rest:
+            page = page_arg(rest[0])
+        try:
+            listing = gif_listing(sub, query, page)
+        except Deadline:
+            listing = {"error": "offline", "q": query, "page": page}
+        print(json.dumps(listing))
         return 0
     if sub in ("insert", "link"):
         if len(rest) < 2:
             return fail(f"gif {sub} needs <id> <url>", 2)
         return gif_send(rest[0], rest[1], as_link=(sub == "link"))
+    if sub == "forget":
+        return gif_forget(rest)
     return fail("usage: emoji-picker gif search|trending|insert|link|key ...", 2)
 
 
 def trusted_media_url(url):
-    host = urllib.parse.urlparse(url).hostname or ""
-    return url.startswith("https://") and (host == "klipy.com" or host.endswith(".klipy.com"))
+    if not isinstance(url, str) or len(url) > 2048 or any(c.isspace() or ord(c) < 32 for c in url):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        host = parsed.hostname or ""
+    except ValueError:
+        return False
+    return (parsed.scheme == "https" and url.startswith("https://") and not parsed.username
+            and (host == "klipy.com" or host.endswith(".klipy.com")))
+
+
+def gif_file_name(slug):
+    return (re.sub(r"[^A-Za-z0-9_\-]", "_", slug)[:80] or "gif") + ".gif"
 
 
 def gif_send(slug, url, as_link):
+    if not SLUG_RE.fullmatch(slug or ""):
+        return fail("that is not a KLIPY GIF id")
     if not trusted_media_url(url):
         return fail("refusing a GIF url that is not on klipy.com")
     if as_link:
         rc = paste(url, "text/plain;charset=utf-8")
     else:
-        path = download(slug, url)
+        path = with_deadline(DOWNLOAD_DEADLINE, download, slug, url)
         if not path:
             notify("Could not download that GIF", "Typed its link instead.")
             rc = paste(url, "text/plain;charset=utf-8")
@@ -321,46 +567,77 @@ def gif_send(slug, url, as_link):
             # A file reference, the way file managers copy files: chat apps attach the
             # file itself, which keeps the animation (a pasted image/gif would not).
             rc = paste(path.as_uri() + "\r\n", "text/uri-list", hold_sec=1.0)
-            forget_later(path)
-    report_share(slug)
+            forget_later(path.name)
+    with_deadline(SHARE_DEADLINE, report_share, slug)
     return rc
 
 
 def download(slug, url):
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    sweep_old_files()
-    safe = re.sub(r"[^A-Za-z0-9_\-]", "_", slug)[:80] or "gif"
-    target = RUNTIME_DIR / f"{safe}.gif"
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    """Fetch a GIF into the runtime directory (RAM, 0700) as a 0600 file. None on any
+    failure, and the caller types the link instead."""
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            blob = resp.read(MAX_GIF_BYTES + 1)
-    except (urllib.error.URLError, TimeoutError, OSError):
+        safe.ensure_dir(RUNTIME_DIR)
+        sweep_old_files()
+        status, blob = safe.http_request(url, headers={"User-Agent": USER_AGENT},
+                                         timeout=20, max_bytes=MAX_GIF_BYTES)
+        if status != 200 or not blob.startswith((b"GIF87a", b"GIF89a")):
+            return None
+        target = RUNTIME_DIR / gif_file_name(slug)
+        safe.write_file(target, blob, mode=0o600)
+        return target
+    except (safe.UnsafeError, OSError, http.client.HTTPException) as e:
+        warn(f"download failed: {e}")
         return None
-    if len(blob) > MAX_GIF_BYTES or not blob.startswith((b"GIF87a", b"GIF89a")):
-        return None
-    tmp = target.with_suffix(".part")
-    tmp.write_bytes(blob)
-    tmp.replace(target)
-    return target
 
 
-def sweep_old_files():
+def _picker_gifs():
+    """(name, lstat) for regular files in the runtime directory that this helper names."""
+    return [(name, st) for name, st in safe.list_dir(RUNTIME_DIR, max_entries=1000)
+            if GIF_NAME_RE.fullmatch(name) and stat.S_ISREG(st.st_mode)]
+
+
+def sweep_old_files(now=None):
     """KLIPY's terms do not allow keeping their files, so a pasted GIF lives only long
     enough for the app to read it."""
-    cutoff = time.time() - GIF_FILE_TTL_SEC
-    for f in RUNTIME_DIR.glob("*"):
-        try:
-            if f.stat().st_mtime < cutoff:
-                f.unlink()
-        except OSError:
-            pass
+    cutoff = (time.time() if now is None else now) - GIF_FILE_TTL_SEC
+    for name, st in _picker_gifs():
+        if st.st_mtime < cutoff:
+            try:
+                safe.remove_file(RUNTIME_DIR / name)
+            except (safe.UnsafeError, OSError):
+                pass
 
 
-def forget_later(path):
-    subprocess.Popen(["sh", "-c", f'sleep {GIF_FILE_TTL_SEC}; rm -f -- "$1"', "_", str(path)],
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True)
+def forget_file(name, now=None):
+    """Remove one pasted GIF once it is TTL old. A newer paste of the same GIF refreshed
+    it and started its own timer, so a younger file is left for that one."""
+    if not GIF_NAME_RE.fullmatch(name or ""):
+        raise safe.UnsafeError(f"not a picker GIF file name: {name!r}")
+    now = time.time() if now is None else now
+    for entry, st in _picker_gifs():
+        if entry == name and st.st_mtime <= now - GIF_FILE_TTL_SEC + FORGET_SLACK_SEC:
+            return safe.remove_file(RUNTIME_DIR / name)
+    return False
+
+
+def gif_forget(args):
+    if len(args) != 1 or not GIF_NAME_RE.fullmatch(args[0]):
+        return fail("gif forget needs a picker GIF file name", 2)
+    time.sleep(GIF_FILE_TTL_SEC)
+    try:
+        forget_file(args[0])
+    except (safe.UnsafeError, OSError) as e:
+        return fail(str(e))
+    return 0
+
+
+def forget_later(name):
+    """Delete the file after the TTL, from a detached, deadline-bound copy of this helper
+    (no shell)."""
+    try:
+        safe.spawn([PYTHON, str(HELPER), "gif", "forget", name], timeout=GIF_FILE_TTL_SEC + 30)
+    except (safe.UnsafeError, OSError) as e:
+        warn(f"could not schedule removal of {name}: {e}")
 
 
 def report_share(slug):
@@ -389,7 +666,12 @@ def main(argv):
     fn = COMMANDS.get(argv[1])
     if not fn:
         return fail(f"unknown command: {argv[1]}", 2)
-    return fn(argv[2:])
+    try:
+        return fn(argv[2:])
+    except Deadline:
+        return fail("timed out")
+    except safe.UnsafeError as e:
+        return fail(str(e))
 
 
 if __name__ == "__main__":

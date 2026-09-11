@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Build the picker's data files from upstream sources.
 
   tools/build-data.py <source-dir>
