@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""Helper for the Emoji picker plugin.
+
+  emoji-picker open                   show the picker
+  emoji-picker insert <text>          type text into the focused app
+  emoji-picker copy <text>            put text on the clipboard only
+  emoji-picker state-write <json>     save recents and skin tone (atomic)
+  emoji-picker forget-recents         clear the recent picks
+
+  emoji-picker gif search <query> [page]
+  emoji-picker gif trending [page]    print results as JSON for the picker
+  emoji-picker gif insert <id> <url>  paste a GIF into the focused app as a file
+  emoji-picker gif link <id> <url>    type the GIF's link instead
+  emoji-picker gif key set            enter a KLIPY API key (stored in the keyring)
+  emoji-picker gif key clear          remove it
+  emoji-picker gif key status         say whether one is stored (never prints it)
+
+Typing works the way Omarchy's own emoji picker does: the text goes on the clipboard
+marked sensitive (so clipboard history skips it), Shift+Insert pastes it, and the
+clipboard is released straight after. That delivers any Unicode regardless of the
+active keyboard layout, where simulated key presses cannot.
+"""
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+PLUGIN_ID = "reidenxerx.emoji-picker"
+STATE_DIR = pathlib.Path(os.environ.get("XDG_STATE_HOME") or pathlib.Path.home() / ".local/state") / "omarchy"
+STATE_FILE = STATE_DIR / "emoji-picker.json"
+CUSTOMER_ID_FILE = STATE_DIR / "emoji-picker-id"
+RUNTIME_DIR = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "omarchy-emoji-picker"
+
+KLIPY_BASE = "https://api.klipy.com/api/v1/"
+KEYRING_ATTRS = ["service", "omarchy-emoji-picker", "provider", "klipy"]
+USER_AGENT = f"{PLUGIN_ID}/1.0 (+https://github.com/ReidenXerx/omarchy-emoji-picker)"
+
+PER_PAGE = 24
+MAX_GIF_BYTES = 12 * 1024 * 1024
+GIF_FILE_TTL_SEC = 600
+
+
+def fail(msg, code=1):
+    print(f"emoji-picker: {msg}", file=sys.stderr)
+    return code
+
+
+def notify(summary, body=""):
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "Emoji picker", summary, body], check=False)
+
+
+# ------------------------------------------------------------------ typing
+
+def paste(payload, mime, hold_sec=0.2):
+    """Offer payload on the clipboard, press Shift+Insert, then withdraw the offer."""
+    if not shutil.which("wl-copy"):
+        return fail("wl-copy is missing (package wl-clipboard)")
+    copier = subprocess.Popen(
+        ["wl-copy", "--type", mime, "--sensitive", "--foreground"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    copier.stdin.write(payload.encode("utf-8"))
+    copier.stdin.close()
+    time.sleep(0.15)
+    if shutil.which("wtype"):
+        subprocess.run(["wtype", "-M", "shift", "-k", "Insert", "-m", "shift"],
+                       stderr=subprocess.DEVNULL, check=False)
+    time.sleep(hold_sec)
+    copier.terminate()
+    return 0
+
+
+def cmd_insert(args):
+    if not args:
+        return fail("insert needs the text to type", 2)
+    return paste(args[0], "text/plain;charset=utf-8")
+
+
+def cmd_copy(args):
+    if not args:
+        return fail("copy needs the text", 2)
+    subprocess.run(["wl-copy", "--type", "text/plain;charset=utf-8"], input=args[0].encode("utf-8"), check=False)
+    return 0
+
+
+def cmd_open(_args):
+    return subprocess.run(["omarchy-shell", "shell", "toggle", PLUGIN_ID, "{}"], check=False).returncode
+
+
+def cmd_forget_recents(_args):
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data["recents"] = {}
+    rc = cmd_state_write([json.dumps(data)])
+    if rc == 0:
+        notify("Recent picks forgotten")
+        print("Forgot recent picks.")
+    return rc
+
+
+def cmd_state_write(args):
+    if not args:
+        return fail("state-write needs JSON", 2)
+    try:
+        data = json.loads(args[0])
+    except ValueError:
+        return fail("state-write: not valid JSON", 2)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    tmp.replace(STATE_FILE)
+    return 0
+
+
+# ------------------------------------------------------------------ keyring
+
+def read_key():
+    """The key stays inside this process: read from the keyring over stdout, used in a
+    request, never passed on a command line or printed."""
+    if not shutil.which("secret-tool"):
+        return None
+    r = subprocess.run(["secret-tool", "lookup", *KEYRING_ATTRS], capture_output=True, text=True, check=False)
+    key = r.stdout.strip()
+    return key or None
+
+
+def cmd_key(args):
+    sub = args[0] if args else "status"
+    if not shutil.which("secret-tool"):
+        return fail("secret-tool is missing (package libsecret)")
+    if sub == "status":
+        print("KLIPY API key: stored in the keyring" if read_key() else "KLIPY API key: not set")
+        return 0
+    if sub == "clear":
+        subprocess.run(["secret-tool", "clear", *KEYRING_ATTRS], check=False)
+        notify("GIF search key removed")
+        print("Removed the KLIPY API key from the keyring.")
+        return 0
+    if sub == "set":
+        return key_set()
+    return fail(f"unknown key command: {sub}", 2)
+
+
+def key_set():
+    if sys.stdin.isatty():
+        import getpass
+        key = getpass.getpass("KLIPY API key (input hidden): ").strip()
+    elif shutil.which("zenity"):
+        r = subprocess.run(
+            ["zenity", "--entry", "--hide-text", "--title=Emoji picker",
+             "--text=Paste your KLIPY API key.\nGet a free one at partner.klipy.com → API Keys.\n"
+             "It is stored in your keyring and only ever sent to KLIPY."],
+            capture_output=True, text=True, check=False)
+        if r.returncode != 0:
+            return 1
+        key = r.stdout.strip()
+    else:
+        key = sys.stdin.readline().strip()
+    if not key:
+        return fail("no key entered")
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{8,200}", key):
+        notify("That does not look like a KLIPY API key", "Nothing was saved.")
+        return fail("that does not look like an API key; nothing saved")
+
+    reply = klipy_request(key, "gifs/trending", {"page": 1, "per_page": 1})
+    if reply.get("error") in ("bad-key",):
+        notify("KLIPY did not accept that key", "Nothing was saved.")
+        return fail("KLIPY rejected the key; nothing saved")
+
+    r = subprocess.run(["secret-tool", "store", "--label=Emoji picker: KLIPY API key", *KEYRING_ATTRS],
+                       input=key, text=True, check=False)
+    if r.returncode != 0:
+        return fail("could not write to the keyring")
+    checked = "" if not reply.get("error") else f" (could not verify it: {reply['error']})"
+    notify("GIF search is ready", "KLIPY API key saved to your keyring." + checked)
+    print("Saved the KLIPY API key to the keyring." + checked)
+    return 0
+
+
+# ------------------------------------------------------------------ KLIPY
+
+def customer_id():
+    """KLIPY asks for a stable per-user id. A random one per install, nothing personal."""
+    try:
+        value = CUSTOMER_ID_FILE.read_text().strip()
+        if re.fullmatch(r"[0-9a-f\-]{36}", value):
+            return value
+    except OSError:
+        pass
+    value = str(uuid.uuid4())
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    CUSTOMER_ID_FILE.write_text(value + "\n")
+    return value
+
+
+def klipy_request(key, path, params=None, method="GET", body=None):
+    url = KLIPY_BASE + urllib.parse.quote(key, safe="") + "/" + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "User-Agent": USER_AGENT, "Accept": "application/json",
+        **({"Content-Type": "application/json"} if data else {})})
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            return json.loads(resp.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        text = e.read().decode("utf-8", "replace")
+        if e.code == 429:
+            return {"error": "rate-limited"}
+        if e.code in (401, 403) or "invalid" in text.lower():
+            return {"error": "bad-key"}
+        return {"error": f"http-{e.code}"}
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return {"error": "offline"}
+    except ValueError:
+        return {"error": "bad-reply"}
+
+
+def pick(file, sizes, kinds, max_bytes=None):
+    for size in sizes:
+        variant = (file or {}).get(size) or {}
+        for kind in kinds:
+            meta = variant.get(kind) or {}
+            if not meta.get("url"):
+                continue
+            if max_bytes and meta.get("size") and meta["size"] > max_bytes:
+                continue
+            return meta
+    return None
+
+
+def normalize_results(reply):
+    if reply.get("error"):
+        return reply
+    if reply.get("result") is False:
+        return {"error": "bad-reply"}
+    data = reply.get("data") or {}
+    items = []
+    for it in data.get("data") or []:
+        if not isinstance(it, dict) or it.get("type") == "ad" or not it.get("slug"):
+            continue
+        file = it.get("file") or {}
+        preview = pick(file, ("sm", "xs", "md"), ("webp", "gif"))
+        full = pick(file, ("hd", "md", "sm"), ("gif",), MAX_GIF_BYTES)
+        if not preview or not full:
+            continue
+        items.append({
+            "id": it["slug"],
+            "title": it.get("title") or "",
+            "preview": preview["url"],
+            "url": full["url"],
+            "w": preview.get("width") or 1,
+            "h": preview.get("height") or 1,
+        })
+    return {"items": items, "hasNext": bool(data.get("has_next"))}
+
+
+def cmd_gif(args):
+    sub = args[0] if args else ""
+    rest = args[1:]
+    if sub == "key":
+        return cmd_key(rest)
+    if sub in ("search", "trending"):
+        page, query = 1, ""
+        if sub == "search":
+            if not rest:
+                return fail("gif search needs a query", 2)
+            query = rest[0].strip()[:100]
+            if len(rest) > 1 and rest[1].isdigit():
+                page = int(rest[1])
+        elif rest and rest[0].isdigit():
+            page = int(rest[0])
+        # Echo what was asked, so the picker can drop a reply to a search the user has
+        # already typed past.
+        echo = {"q": query, "page": page}
+        key = read_key()
+        if not key:
+            print(json.dumps({"error": "no-key", **echo}))
+            return 0
+        params = {"page": page, "per_page": PER_PAGE, "customer_id": customer_id()}
+        if query:
+            params["q"] = query
+        print(json.dumps({**normalize_results(klipy_request(key, "gifs/" + sub, params)), **echo}))
+        return 0
+    if sub in ("insert", "link"):
+        if len(rest) < 2:
+            return fail(f"gif {sub} needs <id> <url>", 2)
+        return gif_send(rest[0], rest[1], as_link=(sub == "link"))
+    return fail("usage: emoji-picker gif search|trending|insert|link|key ...", 2)
+
+
+def trusted_media_url(url):
+    host = urllib.parse.urlparse(url).hostname or ""
+    return url.startswith("https://") and (host == "klipy.com" or host.endswith(".klipy.com"))
+
+
+def gif_send(slug, url, as_link):
+    if not trusted_media_url(url):
+        return fail("refusing a GIF url that is not on klipy.com")
+    if as_link:
+        rc = paste(url, "text/plain;charset=utf-8")
+    else:
+        path = download(slug, url)
+        if not path:
+            notify("Could not download that GIF", "Typed its link instead.")
+            rc = paste(url, "text/plain;charset=utf-8")
+        else:
+            # A file reference, the way file managers copy files: chat apps attach the
+            # file itself, which keeps the animation (a pasted image/gif would not).
+            rc = paste(path.as_uri() + "\r\n", "text/uri-list", hold_sec=1.0)
+            forget_later(path)
+    report_share(slug)
+    return rc
+
+
+def download(slug, url):
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    sweep_old_files()
+    safe = re.sub(r"[^A-Za-z0-9_\-]", "_", slug)[:80] or "gif"
+    target = RUNTIME_DIR / f"{safe}.gif"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            blob = resp.read(MAX_GIF_BYTES + 1)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+    if len(blob) > MAX_GIF_BYTES or not blob.startswith((b"GIF87a", b"GIF89a")):
+        return None
+    tmp = target.with_suffix(".part")
+    tmp.write_bytes(blob)
+    tmp.replace(target)
+    return target
+
+
+def sweep_old_files():
+    """KLIPY's terms do not allow keeping their files, so a pasted GIF lives only long
+    enough for the app to read it."""
+    cutoff = time.time() - GIF_FILE_TTL_SEC
+    for f in RUNTIME_DIR.glob("*"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
+
+
+def forget_later(path):
+    subprocess.Popen(["sh", "-c", f'sleep {GIF_FILE_TTL_SEC}; rm -f -- "$1"', "_", str(path)],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def report_share(slug):
+    key = read_key()
+    if key:
+        klipy_request(key, "gifs/share/" + urllib.parse.quote(slug, safe=""), method="POST",
+                      body={"customer_id": customer_id()})
+
+
+# ------------------------------------------------------------------ main
+
+COMMANDS = {
+    "open": cmd_open,
+    "insert": cmd_insert,
+    "copy": cmd_copy,
+    "state-write": cmd_state_write,
+    "forget-recents": cmd_forget_recents,
+    "gif": cmd_gif,
+}
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0 if len(argv) >= 2 else 2
+    fn = COMMANDS.get(argv[1])
+    if not fn:
+        return fail(f"unknown command: {argv[1]}", 2)
+    return fn(argv[2:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

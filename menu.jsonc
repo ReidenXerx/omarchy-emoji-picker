@@ -1,0 +1,30 @@
+  "setup.emoji-picker": {
+    "icon": "󰇵",
+    "label": "Emoji picker",
+    "aliases": ["emoji", "emojis", "symbols", "kaomoji", "gif", "gifs", "смайлики", "емодзі", "эмодзи"]
+  },
+  "setup.emoji-picker.open": {
+    "icon": "󰇵",
+    "label": "Open the picker",
+    "action": "omarchy-shell shell toggle reidenxerx.emoji-picker '{}'"
+  },
+  "setup.emoji-picker.gifs": {
+    "icon": "󰵸",
+    "label": "Search GIFs",
+    "action": "omarchy-shell shell toggle reidenxerx.emoji-picker '{\"tab\":\"gif\"}'"
+  },
+  "setup.emoji-picker.key": {
+    "icon": "󰌉",
+    "label": "Set the GIF search key",
+    "action": "@PLUGIN_BIN@/emoji-picker gif key set"
+  },
+  "setup.emoji-picker.key-remove": {
+    "icon": "󰌊",
+    "label": "Remove the GIF search key",
+    "action": "@PLUGIN_BIN@/emoji-picker gif key clear"
+  },
+  "setup.emoji-picker.forget": {
+    "icon": "󰋚",
+    "label": "Forget recent picks",
+    "action": "@PLUGIN_BIN@/emoji-picker forget-recents"
+  },

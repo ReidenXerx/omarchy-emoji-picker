@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "reidenxerx.emoji-picker",
+  "name": "Emoji picker",
+  "version": "1.0.0",
+  "author": "ReidenXerx",
+  "license": "MIT",
+  "description": "Emoji, symbols, kaomoji and GIFs, typed straight into the app you were using. Searches English, Ukrainian and Russian names at once, remembers what you use, and keeps your skin tone.",
+  "kinds": ["overlay"],
+  "keepLoaded": true,
+  "entryPoints": { "overlay": "EmojiPicker.qml" }
+}
