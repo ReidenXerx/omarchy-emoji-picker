@@ -555,35 +555,22 @@ Item {
           width: parent.width
           height: root.searchHeight
 
-          TextInput {
+          // Typed keys only: Qt's own text fields would read every new clipboard entry into the shell unbounded.
+          KeyField {
             id: search
             anchors.left: parent.left
             anchors.right: spinner.left
             anchors.verticalCenter: parent.verticalCenter
             color: root.foreground
-            selectionColor: Util.alpha(root.selectedText, 0.35)
-            selectedTextColor: root.foreground
+            placeholderColor: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.58)
+            placeholderText: root.tab === "gif" ? "Search KLIPY"
+              : (root.tab === "symbols" ? "Search symbols…" : (root.tab === "kaomoji" ? "Search kaomoji…" : "Search emoji…"))
             font.family: root.fontFamily
             font.pixelSize: Style.font.heading
             maximumLength: 100
-            clip: true
             focus: true
             onTextChanged: root.query = text
-            Keys.priority: Keys.BeforeItem
-            Keys.onPressed: function(event) { root.handleKey(event) }
-
-            Text {
-              anchors.fill: parent
-              verticalAlignment: Text.AlignVCenter
-              visible: search.text === ""
-              textFormat: Text.PlainText
-              text: root.tab === "gif" ? "Search KLIPY"
-                : (root.tab === "symbols" ? "Search symbols…" : (root.tab === "kaomoji" ? "Search kaomoji…" : "Search emoji…"))
-              color: root.foreground
-              opacity: 0.58
-              font: search.font
-              elide: Text.ElideRight
-            }
+            keyFilter: function (event) { root.handleKey(event) }
           }
 
           Text {
