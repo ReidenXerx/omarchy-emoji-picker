@@ -1,8 +1,12 @@
 #!/usr/bin/python3 -I
 """plasma-type -- put text into the app in front, on KDE Plasma.
 
-  plasma-type [--terminal] [--keep-clipboard] < text
+  plasma-type [--terminal | --auto] [--keep-clipboard] < text
   plasma-type --copy-only < text          only put it on the clipboard
+  plasma-type --which                     print the window in front's class and desktop file
+
+--auto asks KWin which window is in front (through a one-line KWin script, as kdotool does) and uses
+Ctrl+Shift+V when it is a terminal.
 
 Plasma's compositor offers no virtual keyboard to ordinary programs (wtype cannot work there), so this does what
 a person would: the text goes onto the clipboard (through Klipper), the paste keystroke is sent through the
@@ -16,6 +20,7 @@ Text comes on stdin only, never in arguments, and at most 64 KB of it.
 """
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import stat
@@ -39,8 +44,72 @@ RESTORE_AFTER = 0.8
 TIMEOUT = 60            # seconds to wait for a portal answer, the first-time question included
 
 
+# Window classes and desktop files of terminals, matched as substrings, lowered: they paste with Ctrl+Shift+V,
+# because Ctrl+V is a control character to the program inside them.
+TERMINALS = ("konsole", "yakuake", "foot", "kitty", "alacritty", "wezterm", "ghostty", "warp", "gnome-terminal",
+             "org.gnome.console", "ptyxis", "xterm", "urxvt", "terminator", "tilix", "blackbox", "st-256color")
+WHICH_IFACE = "app.duduphudu.PlasmaType"
+WHICH_XML = f"""<node><interface name="{WHICH_IFACE}"><method name="Front">
+  <arg type="s" name="cls" direction="in"/><arg type="s" name="desktop" direction="in"/>
+</method></interface></node>"""
+
+
 class Failed(Exception):
     pass
+
+
+def front_window(bus: Gio.DBusConnection) -> tuple[str, str]:
+    """The class and desktop file of the window in front, from KWin, or ("", "") when it cannot be told.
+
+    KWin has no D-Bus call for this, so a one-line script is loaded that calls back into this process."""
+    answer: dict = {}
+    loop = GLib.MainLoop()
+
+    def on_call(conn, sender, path, iface, method, params, invocation):
+        cls, desktop = params.unpack()
+        answer["cls"], answer["desktop"] = str(cls)[:128], str(desktop)[:128]
+        invocation.return_value(None)
+        loop.quit()
+
+    node = Gio.DBusNodeInfo.new_for_xml(WHICH_XML)
+    reg = bus.register_object("/app/duduphudu/PlasmaType", node.interfaces[0], on_call, None, None)
+    name = "plasmatype_" + secrets.token_hex(6)
+    script = os.path.join(state_dir(), f".{name}.js")
+    try:
+        fd = os.open(script, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            os.write(fd, ("var w = workspace.activeWindow;\n"
+                          f"callDBus({json.dumps(bus.get_unique_name())}, \"/app/duduphudu/PlasmaType\", "
+                          f"\"{WHICH_IFACE}\", \"Front\", w ? String(w.resourceClass) : \"\", "
+                          "w ? String(w.desktopFileName) : \"\");\n").encode())
+        finally:
+            os.close(fd)
+        reply = bus.call_sync("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "loadScript",
+                              GLib.Variant("(ss)", (script, name)), GLib.VariantType("(i)"),
+                              Gio.DBusCallFlags.NONE, 3000, None)
+        number = reply.unpack()[0]
+        try:
+            bus.call_sync("org.kde.KWin", f"/Scripting/Script{number}", "org.kde.kwin.Script", "run", None, None,
+                          Gio.DBusCallFlags.NONE, 3000, None)
+            GLib.timeout_add(2000, loop.quit)
+            loop.run()
+        finally:
+            bus.call_sync("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "unloadScript",
+                          GLib.Variant("(s)", (name,)), None, Gio.DBusCallFlags.NONE, 3000, None)
+    except GLib.Error:
+        pass
+    finally:
+        bus.unregister_object(reg)
+        try:
+            os.unlink(script)
+        except OSError:
+            pass
+    return answer.get("cls", ""), answer.get("desktop", "")
+
+
+def is_terminal(cls: str, desktop: str) -> bool:
+    seen = f"{cls} {desktop}".lower()
+    return any(name in seen for name in TERMINALS)
 
 
 def state_dir() -> str:
@@ -160,9 +229,17 @@ def main(argv: list[str]) -> int:
     terminal = "--terminal" in argv
     keep = "--keep-clipboard" in argv
     copy_only = "--copy-only" in argv
-    if any(a not in ("--terminal", "--keep-clipboard", "--copy-only") for a in argv):
+    if any(a not in ("--terminal", "--auto", "--keep-clipboard", "--copy-only", "--which") for a in argv):
         print(__doc__.split("\n\n")[1], file=sys.stderr)
         return 2
+    if "--which" in argv:
+        try:
+            cls, desktop = front_window(Gio.bus_get_sync(Gio.BusType.SESSION, None))
+        except (Failed, GLib.Error, OSError) as problem:
+            print(f"plasma-type: {problem}", file=sys.stderr)
+            return 1
+        print(json.dumps({"class": cls, "desktop": desktop, "terminal": is_terminal(cls, desktop)}))
+        return 0
     raw = sys.stdin.buffer.read(TEXT_MAX + 1)
     if len(raw) > TEXT_MAX:
         print("plasma-type: more than 64 KB of text", file=sys.stderr)
@@ -177,6 +254,8 @@ def main(argv: list[str]) -> int:
             return 0
         before = None if keep else klipper(bus, "getClipboardContents")
         klipper(bus, "setClipboardContents", text)
+        if "--auto" in argv:
+            terminal = is_terminal(*front_window(bus))
         portal = Portal(bus)
         session = portal.start()
         try:
