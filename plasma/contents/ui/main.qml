@@ -2,7 +2,6 @@ import QtQuick
 import org.kde.plasma.plasmoid
 import org.kde.plasma.core as PlasmaCore
 import org.kde.plasma.plasma5support as P5Support
-import org.kde.taskmanager as TaskManager
 import "../code/EmojiModel.js" as Model
 import "../code/EmojiData.js" as Data
 
@@ -14,9 +13,11 @@ import "../code/EmojiData.js" as Data
 PlasmoidItem {
   id: root
 
-  readonly property string code: String(Qt.resolvedUrl("../code")).replace("file://", "")
+  readonly property string code: decodeURIComponent(String(Qt.resolvedUrl("../code")).replace("file://", ""))
+  // Optional variables only when set: an empty one is not the same as none (an empty bus address breaks D-Bus).
   readonly property string envPrefix: "/usr/bin/env -i HOME=\"$HOME\" PATH=/usr/bin:/bin LANG=C.UTF-8 PYTHONIOENCODING=utf-8"
-    + " XDG_RUNTIME_DIR=\"$XDG_RUNTIME_DIR\" XDG_STATE_HOME=\"$XDG_STATE_HOME\" DBUS_SESSION_BUS_ADDRESS=\"$DBUS_SESSION_BUS_ADDRESS\" "
+    + " XDG_RUNTIME_DIR=\"$XDG_RUNTIME_DIR\" ${XDG_STATE_HOME:+XDG_STATE_HOME=\"$XDG_STATE_HOME\"}"
+    + " ${DBUS_SESSION_BUS_ADDRESS:+DBUS_SESSION_BUS_ADDRESS=\"$DBUS_SESSION_BUS_ADDRESS\"} "
 
   function quote(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'" }
   function helper(name) { return root.envPrefix + "/usr/bin/python3 -I " + root.quote(root.code + "/bin/" + name) }
@@ -117,34 +118,13 @@ PlasmoidItem {
   function setupKey() {
     root.expanded = false
     var cmd = root.helper("emoji-picker") + " gif key set"
-    var term = "if [ -x /usr/bin/konsole ]; then /usr/bin/setsid -f /usr/bin/konsole --hold -e /usr/bin/bash -c " + root.quote(cmd)
-             + "; else /usr/bin/setsid -f /usr/bin/xdg-terminal-exec /usr/bin/bash -c " + root.quote(cmd + "; read -r -p 'Press Enter to close'")
+    var term = "if [ -x /usr/bin/konsole ]; then /usr/bin/systemd-run --user --collect --quiet -- /usr/bin/konsole --hold -e /usr/bin/bash -c " + root.quote(cmd)
+             + "; else /usr/bin/systemd-run --user --collect --quiet -- /usr/bin/xdg-terminal-exec /usr/bin/bash -c " + root.quote(cmd + "; read -r -p 'Press Enter to close'")
              + "; fi >/dev/null 2>&1"
     root.run(term, null)
   }
 
   // ---------------------------------------------------------------- typing it
-
-  // The app in front when the picker opened (an open popup is never a task), and whether it is a terminal, where
-  // paste is Ctrl+Shift+V.
-  TaskManager.TasksModel {
-    id: tasks
-    filterByVirtualDesktop: false
-    filterByScreen: false
-    filterByActivity: false
-    groupMode: TaskManager.TasksModel.GroupDisabled
-    // While the picker has the keyboard there is no active task, so the last real one is remembered.
-    onActiveTaskChanged: {
-      var i = tasks.activeTask
-      if (i && i.valid)
-        root.frontApp = String(tasks.data(i, TaskManager.AbstractTasksModel.AppId) || "").replace(/\.desktop$/, "").toLowerCase()
-    }
-  }
-  property string frontApp: ""
-  readonly property var terminals: ["org.kde.konsole", "konsole", "org.kde.yakuake", "yakuake", "foot", "kitty", "alacritty",
-    "com.mitchellh.ghostty", "org.wezfurlong.wezterm", "dev.warp.warp", "org.gnome.console", "org.gnome.terminal", "xterm",
-    "org.gnome.ptyxis", "tilix", "terminator"]
-  function frontIsTerminal() { return root.terminals.indexOf(root.frontApp) >= 0 }
 
   property string trouble: ""
 
@@ -155,14 +135,13 @@ PlasmoidItem {
     root.lastTab = tab
     root.saveState()
     var text = item.kind === "gif" ? item.url : Model.textFor(item, root.tone)
-    var terminal = root.frontIsTerminal()
     root.expanded = false
     if (mode === "copy") {
       root.run("/usr/bin/printf '%s' " + root.quote(text) + " | " + root.helper("plasma-type") + " --copy-only", root.report)
       return
     }
     // Typed once the popup has gone and the app you were using has the keyboard again.
-    root.pending = { text: text, terminal: terminal }
+    root.pending = { text: text }
     typeLater.restart()
   }
 
@@ -174,8 +153,9 @@ PlasmoidItem {
       var p = root.pending
       root.pending = null
       if (!p) return
+      // --auto: KWin is asked which window has the keyboard now, so a terminal gets Ctrl+Shift+V.
       root.run("/usr/bin/printf '%s' " + root.quote(p.text) + " | /usr/bin/timeout -k 2 90 " + root.helper("plasma-type")
-               + (p.terminal ? " --terminal" : ""), root.report)
+               + " --auto", root.report)
     }
   }
 

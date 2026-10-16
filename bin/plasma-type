@@ -20,6 +20,8 @@ Text comes on stdin only, never in arguments, and at most 64 KB of it.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import secrets
@@ -42,12 +44,14 @@ PERSIST_UNTIL_REVOKED = 2
 CTRL, SHIFT, KEY_V = 29, 42, 47
 RESTORE_AFTER = 0.8
 TIMEOUT = 60            # seconds to wait for a portal answer, the first-time question included
+LOCK_WAIT = 10          # seconds to wait for an earlier paste to finish
 
 
 # Window classes and desktop files of terminals, matched as substrings, lowered: they paste with Ctrl+Shift+V,
 # because Ctrl+V is a control character to the program inside them.
 TERMINALS = ("konsole", "yakuake", "foot", "kitty", "alacritty", "wezterm", "ghostty", "warp", "gnome-terminal",
-             "org.gnome.console", "ptyxis", "xterm", "urxvt", "terminator", "tilix", "blackbox", "st-256color")
+             "org.gnome.console", "ptyxis", "xterm", "urxvt", "terminator", "tilix", "blackbox", "st-256color",
+             "footclient", "xfce4-terminal", "terminology", "rio", "contour", "kgx", "cool-retro-term")
 WHICH_IFACE = "app.duduphudu.PlasmaType"
 WHICH_XML = f"""<node><interface name="{WHICH_IFACE}"><method name="Front">
   <arg type="s" name="cls" direction="in"/><arg type="s" name="desktop" direction="in"/>
@@ -108,8 +112,14 @@ def front_window(bus: Gio.DBusConnection) -> tuple[str, str]:
 
 
 def is_terminal(cls: str, desktop: str) -> bool:
-    seen = f"{cls} {desktop}".lower()
-    return any(name in seen for name in TERMINALS)
+    """Whole names only: the class, the desktop file, or their last dotted part ("org.kde.konsole" -> "konsole"), so
+    "warp" never matches "warpinator"."""
+    seen = set()
+    for name in (cls, desktop):
+        name = name.lower().removesuffix(".desktop")
+        if name:
+            seen.update((name, name.rsplit(".", 1)[-1]))
+    return any(name in seen for name in TERMINALS) or "org.gnome.console" in seen
 
 
 def state_dir() -> str:
@@ -199,7 +209,10 @@ class Portal:
         if not int(started.get("devices", 0)) & KEYBOARD:
             raise Failed("the desktop gave no keyboard")
         if started.get("restore_token"):
-            write_token(str(started["restore_token"]))
+            try:
+                write_token(str(started["restore_token"]))
+            except OSError:
+                pass        # the paste still works; Plasma just asks again next time
         return session
 
     def key(self, session: str, code: int, pressed: bool) -> None:
@@ -244,7 +257,8 @@ def main(argv: list[str]) -> int:
     if len(raw) > TEXT_MAX:
         print("plasma-type: more than 64 KB of text", file=sys.stderr)
         return 2
-    text = raw.decode("utf-8", "replace")
+    # D-Bus strings end at a NUL, which would cut the text off without a word.
+    text = raw.decode("utf-8", "replace").replace("\0", "")
     if not text:
         return 0
     try:
@@ -252,28 +266,66 @@ def main(argv: list[str]) -> int:
         if copy_only:
             klipper(bus, "setClipboardContents", text)
             return 0
-        before = None if keep else klipper(bus, "getClipboardContents")
-        klipper(bus, "setClipboardContents", text)
-        if "--auto" in argv:
-            terminal = is_terminal(*front_window(bus))
+        # One at a time: a second run started inside the first one's restore would take the first one's text for
+        # "your clipboard", or paste what the first one had just put back.
+        with one_at_a_time():
+            return type_text(bus, text, terminal, keep, "--auto" in argv)
+    except (Failed, GLib.Error, OSError) as problem:
+        print(f"plasma-type: {problem}", file=sys.stderr)
+        return 1
+
+
+@contextlib.contextmanager
+def one_at_a_time():
+    fd = os.open(os.path.join(state_dir(), "lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        deadline = time.monotonic() + LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise Failed("another paste is still running") from None
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
+def type_text(bus: Gio.DBusConnection, text: str, terminal: bool, keep: bool, auto: bool) -> int:
+    before = None if keep else klipper(bus, "getClipboardContents")
+    if auto:
+        terminal = is_terminal(*front_window(bus))
+    klipper(bus, "setClipboardContents", text)
+    try:
         portal = Portal(bus)
         session = portal.start()
         try:
             chord = [CTRL, SHIFT, KEY_V] if terminal else [CTRL, KEY_V]
-            for code in chord:
-                portal.key(session, code, True)
-            for code in reversed(chord):
-                portal.key(session, code, False)
+            pressed = []
+            try:
+                for code in chord:
+                    portal.key(session, code, True)
+                    pressed.append(code)
+            finally:
+                for code in reversed(pressed):
+                    try:
+                        portal.key(session, code, False)
+                    except GLib.Error:
+                        pass
             time.sleep(0.05)
         finally:
             portal.close(session)
+        # Long enough for the app to have asked for the clipboard before yours is back.
+        time.sleep(RESTORE_AFTER)
+    finally:
+        # Put back whatever happened, a refused or failed paste included: the clipboard you had is never lost.
         if before is not None:
-            # Long enough for the app to have asked for the clipboard; then yours is back.
-            time.sleep(RESTORE_AFTER)
-            klipper(bus, "setClipboardContents", before)
-    except (Failed, GLib.Error, OSError) as problem:
-        print(f"plasma-type: {problem}", file=sys.stderr)
-        return 1
+            try:
+                klipper(bus, "setClipboardContents", before)
+            except Failed:
+                pass
     return 0
 
 
