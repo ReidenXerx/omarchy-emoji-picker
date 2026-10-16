@@ -35,6 +35,30 @@ To add its entries to the Omarchy menu as well:
 It needs `wl-copy` and `wtype` (both in Omarchy's default set). GIF search also needs
 `secret-tool`, which comes with gnome-keyring.
 
+## On KDE Plasma
+
+The picker also comes as a Plasma 6 widget: the same search (English,
+Ukrainian and Russian names at once), the same four tabs, recents and skin
+tones, in a popup drawn with Plasma's controls. Install it from the KDE Store
+(Add Widgets → Get New Widgets → search "Emoji picker") or build it here:
+
+```bash
+tools/build-plasma          # dist/emoji-picker.plasmoid
+kpackagetool6 -t Plasma/Applet -i dist/app.duduphudu.emoji-picker
+```
+
+Give it a key in the widget's settings (Keyboard Shortcuts); Meta+. is
+Plasma's own Emoji Selector, so Meta+Ctrl+E is a good choice.
+
+Plasma does not let ordinary programs simulate a keyboard, so a pick is typed
+the way a person would: it goes onto the clipboard through Klipper, paste is
+pressed through the desktop's RemoteDesktop portal (Ctrl+Shift+V in a
+terminal, Ctrl+V elsewhere), and your clipboard is put back a moment later.
+The first time, Plasma asks whether this may control the keyboard; tick
+"Allow without asking next time" and it never asks again. GIFs are typed as
+their link (Shift+Enter or a right click copies it instead), since Klipper
+holds text only.
+
 ## Use
 
 | key | does |

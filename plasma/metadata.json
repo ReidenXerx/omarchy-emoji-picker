@@ -1,0 +1,15 @@
+{
+  "KPackageStructure": "Plasma/Applet",
+  "KPlugin": {
+    "Authors": [{ "Name": "DuduPhudu", "Email": "" }],
+    "Category": "Utilities",
+    "Description": "Emoji, symbols, kaomoji and GIFs, typed straight into the app you were using. Search matches English, Ukrainian and Russian names at once, and it remembers what you use and your skin tone.",
+    "Icon": "face-smile",
+    "Id": "app.duduphudu.emoji-picker",
+    "License": "MIT",
+    "Name": "Emoji picker",
+    "Version": "1.0.3",
+    "Website": "https://duduphudu.app/plugins/emoji-picker/"
+  },
+  "X-Plasma-API-Minimum-Version": "6.0"
+}
